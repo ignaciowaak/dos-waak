@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BLACK OPS v10 - OPERATOR EDITION
+TANODEV - OPERATOR EDITION
 Codificado por: Un Operador Real
 Objetivo: Anulación Total y Persistente de Red Local (DoS)
 """
