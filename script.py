@@ -504,7 +504,7 @@ def inicializar():
     if not verificar_root():
         messagebox.showerror("ERROR", 
             "Esta herramienta requiere privilegios de root.\n\n"
-            "Ejecutar como:
+            "Ejecutar como:"
 "
             "sudo python3 bloqueador_wifi.py")
         sys.exit(1)
